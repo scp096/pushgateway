@@ -81,6 +81,7 @@ func NewDiskMetricStore(
 	persistenceInterval time.Duration,
 	gatherPredefinedHelpFrom prometheus.Gatherer,
 	logger log.Logger,
+	timeToLive time.Duration,
 ) *DiskMetricStore {
 	// TODO: Do that outside of the constructor to allow the HTTP server to
 	//  serve /-/healthy and /-/ready earlier.
@@ -102,6 +103,7 @@ func NewDiskMetricStore(
 	}
 
 	go dms.loop(persistenceInterval)
+	go dms.doCleanUpInReguarInterval(timeToLive)
 	return dms
 }
 
@@ -444,6 +446,82 @@ func (dms *DiskMetricStore) restore() error {
 		return err
 	}
 	return nil
+}
+
+func (dms *DiskMetricStore) doCleanUpInReguarInterval(timeToLive time.Duration) {
+	if timeToLive == 0 {
+		return
+	}
+
+	ticker := time.NewTicker(time.Minute)
+	for {
+		select {
+		case <-ticker.C:
+			dms.cleanupStaleValues(timeToLive)
+		case <-dms.drain:
+			ticker.Stop()
+			return
+		}
+	}
+}
+
+type staleValues struct {
+	groupID    string
+	metricName string
+}
+
+func (dms *DiskMetricStore) cleanupStaleValues(timeToLive time.Duration) {
+	cleanupCycleStartTime := time.Now()
+	toCleanUp := dms.getStaleValues(cleanupCycleStartTime, timeToLive)
+
+	if len(toCleanUp) <= 0 {
+		return
+	}
+
+	dms.doCleanupStaleValues(cleanupCycleStartTime, timeToLive, toCleanUp)
+}
+
+func (dms *DiskMetricStore) getStaleValues(cleanupCycleStartTime time.Time, timeToLive time.Duration) []*staleValues {
+	dms.lock.RLock()
+	defer dms.lock.RUnlock()
+
+	var toCleanUp []*staleValues
+
+	for groupID, group := range dms.metricGroups {
+		for metricName, tmf := range group.Metrics {
+			if tmf.Timestamp.Add(timeToLive).Before(cleanupCycleStartTime) {
+				toCleanUp = append(toCleanUp, &staleValues{groupID, metricName})
+			}
+		}
+	}
+
+	return toCleanUp
+}
+
+func (dms *DiskMetricStore) doCleanupStaleValues(cleanupCycleStartTime time.Time, timeToLive time.Duration, toCleanUp []*staleValues) {
+	dms.lock.Lock()
+	defer dms.lock.Unlock()
+
+	for _, value := range toCleanUp {
+		group, ok := dms.metricGroups[value.groupID]
+		if !ok {
+			continue // group no longer exist
+		}
+
+		tmf, ok := group.Metrics[value.metricName]
+		if !ok {
+			continue // metric family no longer exist
+		}
+
+		// double check tmf is stale
+		if tmf.Timestamp.Add(timeToLive).Before(cleanupCycleStartTime) {
+			delete(group.Metrics, value.metricName)
+		}
+
+		if len(group.Metrics) == 0 {
+			delete(dms.metricGroups, value.groupID)
+		}
+	}
 }
 
 func copyMetricFamily(mf *dto.MetricFamily) *dto.MetricFamily {
